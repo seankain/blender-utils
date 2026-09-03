@@ -46,8 +46,9 @@ Textures are written as `<Object>_<pass>.png`, e.g.
 | --- | --- | --- |
 | `--import-file` | – | Import `.fbx/.obj/.gltf/.glb/.dae` before baking |
 | `--output-dir` | `baked` | Where the textures go |
-| `--passes` | `diffuse,metallic,emission` | Also supports `roughness`, `normal` |
+| `--passes` | `diffuse,metallic,emission` | Also supports `alpha`, `roughness`, `normal` |
 | `--diffuse-mode` | `basecolor` | `basecolor` or `diffuse-pass` (see below) |
+| `--pack-alpha` | off | Composite the alpha bake into the diffuse map's alpha channel |
 | `--resolution` | `1024` | Square texture size |
 | `--samples` | `8` | Cycles samples per bake |
 | `--margin` | `8` | Bake margin in pixels |
@@ -75,6 +76,19 @@ Textures are written as `<Object>_<pass>.png`, e.g.
   areas bake black and get darkened again when the metallic map is applied in
   an engine. Use `--diffuse-mode diffuse-pass` if you want Blender's pass
   instead.
+* **Alpha** is baked from the Principled `Alpha` input by the same route, and
+  materials with no alpha input (Glass BSDF and friends) bake opaque. It is
+  not in the default pass list — add it with
+  `--passes diffuse,metallic,emission,alpha`, or use `--pack-alpha`:
+
+  ```sh
+  blender -b scene.blend -P bake_materials.py -- --pack-alpha
+  ```
+
+  which bakes it and composites it into the alpha channel of the diffuse map,
+  producing one RGBA texture (`CHANNEL_PACKED`, so the colour channels are
+  left untouched). The standalone `<Object>_alpha.png` is still written. The
+  rebuilt material wires alpha up and switches to blended rendering.
 * **Emission** uses the native `EMIT` pass, so it works for any shader.
 * Non-Principled materials (Diffuse/Glass/Emission BSDF) fall back to their
   `Color` input; a material with no usable shader bakes black rather than
@@ -82,4 +96,3 @@ Textures are written as `<Object>_<pass>.png`, e.g.
 * Objects with no materials are skipped, as are extra objects sharing a mesh
   that was already baked. Empty material slots get a temporary placeholder so
   the bake operator accepts them.
-* Alpha/transparency is not baked.

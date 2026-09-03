@@ -28,13 +28,16 @@ Notes
   returns base colour * (1 - metallic), so metal areas come out black and get
   darkened a second time when the metallic map is applied in an engine; it is
   still available as --diffuse-mode diffuse-pass.
+* Alpha is baked from the "Alpha" input by the same route, and materials with
+  no alpha input bake opaque. --pack-alpha additionally composites it into the
+  alpha channel of the diffuse map, giving a single RGBA texture.
 * Emission uses the native EMIT pass, so it captures emission colour times
   strength for any shader, Principled or not.
 * Baking several materials into one image needs a non-overlapping UV layout,
   so by default a dedicated UV map ("BakeUV") is generated with Smart UV
   Project. Use --uv-mode existing to bake into the UVs the asset ships with.
 * Objects with no material, and extra objects sharing an already baked mesh,
-  are skipped. Alpha/transparency is not baked.
+  are skipped.
 """
 
 from __future__ import annotations
@@ -50,13 +53,17 @@ import bpy
 # --------------------------------------------------------------------------
 # Pass definitions
 # --------------------------------------------------------------------------
-PASS_NAMES = ("diffuse", "metallic", "emission", "roughness", "normal")
+PASS_NAMES = ("diffuse", "metallic", "emission", "alpha", "roughness", "normal")
 DEFAULT_PASSES = ("diffuse", "metallic", "emission")
 
 # Shader input names looked up (in order) when a pass is baked by temporarily
 # routing that input through an Emission shader.
 BASE_COLOR_SOCKETS = ("Base Color", "Color")
 METALLIC_SOCKETS = ("Metallic",)
+ALPHA_SOCKETS = ("Alpha",)
+
+# Value used when a material exposes no matching input at all.
+PASS_FALLBACKS = {"metallic": 0.0, "alpha": 1.0}
 
 FILE_EXTENSIONS = {
     "PNG": ".png",
@@ -86,6 +93,8 @@ def pass_plan(pass_name: str, args):
         return "DIFFUSE", False, None
     if pass_name == "metallic":
         return "EMIT", True, METALLIC_SOCKETS
+    if pass_name == "alpha":
+        return "EMIT", True, ALPHA_SOCKETS
     if pass_name == "emission":
         return "EMIT", False, None
     if pass_name == "roughness":
@@ -130,6 +139,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "input; 'diffuse-pass' uses Cycles' Diffuse/Color "
                              "pass, which returns base colour * (1 - metallic) "
                              "and therefore darkens metals.")
+    parser.add_argument("--pack-alpha", action="store_true",
+                        help="Also composite the alpha bake into the alpha "
+                             "channel of the diffuse texture, giving one RGBA "
+                             "map. Implies the 'alpha' pass; the standalone "
+                             "alpha map is still written.")
     parser.add_argument("--resolution", type=int, default=1024,
                         help="Baked texture size in pixels, square "
                              "(default: %(default)s).")
@@ -180,6 +194,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("unknown pass(es): %s" % ", ".join(unknown))
     if not args.passes:
         parser.error("no passes requested")
+    if args.pack_alpha:
+        if "diffuse" not in args.passes:
+            parser.error("--pack-alpha needs the 'diffuse' pass")
+        if "alpha" not in args.passes:
+            args.passes.append("alpha")
     args.only = ([n.strip() for n in args.only.split(",") if n.strip()]
                  if args.only else None)
     return args
@@ -455,17 +474,38 @@ def find_principled(node_tree):
     return None
 
 
-def new_image(name: str, size: int, is_data: bool):
+def new_image(name: str, size: int, is_data: bool, alpha: bool = False):
     """Create (or reset) a square 8-bit image to bake into."""
     existing = bpy.data.images.get(name)
     if existing is not None:
         bpy.data.images.remove(existing)
     image = bpy.data.images.new(name, width=size, height=size,
-                                alpha=False, float_buffer=False)
+                                alpha=alpha, float_buffer=False)
     image.generated_color = (0.0, 0.0, 0.0, 1.0)
     if is_data:
         image.colorspace_settings.name = "Non-Color"
+    if alpha:
+        # The alpha channel carries a baked mask, not a matte for the colour
+        # channels, so it must not be premultiplied or straightened on save.
+        image.alpha_mode = "CHANNEL_PACKED"
     return image
+
+
+def pack_alpha_channel(colour_image, alpha_image) -> None:
+    """Copy the red channel of ``alpha_image`` into ``colour_image``'s alpha."""
+    if tuple(colour_image.size) != tuple(alpha_image.size):
+        raise RuntimeError("cannot pack alpha: %s is %dx%d but %s is %dx%d"
+                           % (alpha_image.name, alpha_image.size[0],
+                              alpha_image.size[1], colour_image.name,
+                              colour_image.size[0], colour_image.size[1]))
+    texels = colour_image.size[0] * colour_image.size[1]
+    colour = [0.0] * (texels * 4)
+    mask = [0.0] * (texels * 4)
+    colour_image.pixels.foreach_get(colour)
+    alpha_image.pixels.foreach_get(mask)
+    colour[3::4] = mask[0::4]
+    colour_image.pixels.foreach_set(colour)
+    colour_image.update()
 
 
 def add_bake_targets(materials, image, uv_name):
@@ -595,10 +635,11 @@ def bake_pass(obj, pass_name: str, image, uv_name: str, args) -> None:
     materials = object_materials(obj)
 
     def fallback(mat):
-        # Used only when the material exposes no matching shader input.
+        # Used only when the material exposes no matching shader input:
+        # its viewport colour for diffuse, opaque for alpha, 0 otherwise.
         if pass_name == "diffuse":
             return tuple(mat.diffuse_color)
-        return 0.0
+        return PASS_FALLBACKS.get(pass_name, 0.0)
 
     restore_targets = add_bake_targets(materials, image, uv_name)
     restore_graph = (route_inputs_to_emission(materials, rewire_sockets, fallback)
@@ -628,6 +669,21 @@ def save_image(image, directory: str, file_format: str) -> str:
     return path
 
 
+def set_alpha_blending(mat) -> None:
+    """Make the material render its alpha channel in EEVEE.
+
+    Blender 4.2 replaced ``blend_method`` with ``surface_render_method``; both
+    are set where they exist so the result previews correctly on either.
+    """
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = "BLENDED"
+    if hasattr(mat, "blend_method"):
+        try:
+            mat.blend_method = "BLEND"
+        except TypeError:
+            pass
+
+
 def build_baked_material(obj, images, args):
     """Replace the object's materials with one Principled BSDF using the bakes."""
     name = "%s_baked" % obj.name
@@ -651,8 +707,10 @@ def build_baked_material(obj, images, args):
         "metallic": ("Metallic", 0),
         "roughness": ("Roughness", -300),
         "emission": ("Emission Color", -600),
+        "alpha": ("Alpha", -1200),
         "normal": ("Normal", -900),
     }
+    diffuse_node = None
     for pass_name, image in images.items():
         socket_name, y = slots.get(pass_name, (None, 0))
         if socket_name is None:
@@ -661,10 +719,20 @@ def build_baked_material(obj, images, args):
                   or principled.inputs.get("Emission"))
         if socket is None:
             continue
+        # With --pack-alpha the mask already rides in the diffuse texture, so
+        # it is wired from there instead of loading the same data twice.
+        if pass_name == "alpha" and args.pack_alpha and diffuse_node is not None:
+            node_tree.links.new(diffuse_node.outputs["Alpha"], socket)
+            set_alpha_blending(mat)
+            continue
         tex = node_tree.nodes.new("ShaderNodeTexImage")
         tex.image = image
         tex.label = pass_name
         tex.location = (-500, y)
+        if pass_name == "diffuse":
+            diffuse_node = tex
+        if pass_name == "alpha":
+            set_alpha_blending(mat)
         if pass_name == "normal":
             normal_map = node_tree.nodes.new("ShaderNodeNormalMap")
             normal_map.location = (-200, y)
@@ -701,16 +769,25 @@ def bake_object(obj, args, output_dir: str) -> dict:
         log("%s: %d slot(s), UV map '%s'"
             % (obj.name, len(obj.material_slots), uv_name))
         safe_name = obj.name.replace(" ", "_").replace(os.sep, "_")
+        timings = {}
         for pass_name in args.passes:
             _bake_type, is_data, _rewire = pass_plan(pass_name, args)
             image = new_image("%s_%s" % (safe_name, pass_name),
-                              args.resolution, is_data)
+                              args.resolution, is_data,
+                              alpha=args.pack_alpha and pass_name == "diffuse")
             start = time.time()
             bake_pass(obj, pass_name, image, uv_name, args)
+            timings[pass_name] = time.time() - start
+            images[pass_name] = image
+
+        # Compositing has to happen before the diffuse map is written out.
+        if args.pack_alpha:
+            pack_alpha_channel(images["diffuse"], images["alpha"])
+
+        for pass_name, image in images.items():
             path = save_image(image, output_dir, args.file_format)
             log("  %-9s -> %s (%.1fs)"
-                % (pass_name, os.path.basename(path), time.time() - start))
-            images[pass_name] = image
+                % (pass_name, os.path.basename(path), timings[pass_name]))
     finally:
         restore_slots()
         restore_state()
